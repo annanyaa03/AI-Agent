@@ -1,10 +1,22 @@
+.env
+.env.local
+.env.*.local
+
 node_modules/
 artifacts/
 cache/
 coverage/
-.env
+
+venv/
 .venv/
+
 __pycache__/
 *.pyc
+
 .runtime/
 
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
