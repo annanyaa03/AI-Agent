@@ -195,7 +195,8 @@ Trade Execution
 Built by:
 
 * Indra Kurkute
-* Team Members
+* Alok Aage
+* Annanya Ukey
 
 ---
 
