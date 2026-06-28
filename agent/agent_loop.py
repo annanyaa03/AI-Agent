@@ -9,7 +9,12 @@ from decimal import Decimal
 from typing import Any
 
 import os
-from openai import OpenAI
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
 from pydantic import BaseModel, Field, ValidationError
 
 try:
@@ -114,6 +119,10 @@ class AgentLoop:
             current_quote=Decimal(str(real_quote))
         )
         self.llm_enabled = bool(env("NVIDIA_API_KEY", default="")) and not env_bool("DISABLE_LLM", False)
+        if self.llm_enabled and OpenAI is None:
+            LOGGER.warning("NVIDIA_API_KEY is set but openai package is not installed. LLM will be disabled.")
+            self.llm_enabled = False
+
         self.llm = (
             OpenAI(
                 api_key=env("NVIDIA_API_KEY", required=True),
