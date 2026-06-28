@@ -81,6 +81,31 @@ class KillSwitchClient:
             "next_trade_at": next_trade_at
         }
 
+    def get_real_balances(self) -> tuple[float, float]:
+        mon_wei = self.web3.eth.get_balance(self.owner_address)
+        base_balance = float(Web3.from_wei(mon_wei, "ether"))
+
+        quote_address = env("DEX_QUOTE_TOKEN_ADDRESS", default="")
+        quote_decimals = env_int("DEX_QUOTE_TOKEN_DECIMALS", default=6)
+        quote_balance = 0.0
+
+        if quote_address:
+            erc20_abi = [{
+                "constant": True,
+                "inputs": [{"name": "_owner", "type": "address"}],
+                "name": "balanceOf",
+                "outputs": [{"name": "balance", "type": "uint256"}],
+                "type": "function",
+            }]
+            try:
+                contract = self.web3.eth.contract(address=Web3.to_checksum_address(quote_address), abi=erc20_abi)
+                bal = contract.functions.balanceOf(self.owner_address).call()
+                quote_balance = bal / (10 ** quote_decimals)
+            except Exception as exc:
+                LOGGER.warning("Could not fetch quote balance: %s", exc)
+
+        return base_balance, quote_balance
+
     def execute_trade(self, action: str, size: float | Decimal) -> TradeExecutionResult:
         normalized_action = action.lower()
         if normalized_action == "hold":

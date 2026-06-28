@@ -30,7 +30,14 @@ except ImportError:  # pragma: no cover
 
 LOGGER = logging.getLogger("agent.agent_loop")
 
-SYSTEM_PROMPT = """You are an institutional crypto trading assistant. Analyze the provided market data and return ONLY valid JSON."""
+SYSTEM_PROMPT = """You are an institutional crypto trading assistant. Analyze the provided market data and return ONLY valid JSON matching this exact schema:
+{
+  "action": "BUY" | "SELL" | "HOLD",
+  "confidence": <float between 0 and 100>,
+  "size": <float, use proposed default if BUY/SELL, else 0>,
+  "reason": "<string explaining your rationale concisely>"
+}
+Do not include any other text or markdown formatting."""
 
 
 class LlmDecision(BaseModel):
@@ -92,11 +99,19 @@ class AgentLoop:
         self.poll_seconds = env_int("AGENT_POLL_SECONDS", 30)
         self.base_order_size = env_decimal("BASE_ORDER_SIZE", "25")
         self.price_history: list[dict[str, Any]] = []
+        
+        try:
+            real_base, real_quote = self.chain_client.get_real_balances()
+        except Exception as e:
+            LOGGER.warning("Failed to fetch real balances, using defaults: %s", e)
+            real_base = float(env_decimal("SIMULATED_STARTING_BASE_BALANCE", "0"))
+            real_quote = float(env_decimal("SIMULATED_STARTING_QUOTE_BALANCE", "1000"))
+
         self.portfolio = PortfolioState(
-            starting_base=env_decimal("SIMULATED_STARTING_BASE_BALANCE", "0"),
-            starting_quote=env_decimal("SIMULATED_STARTING_QUOTE_BALANCE", "1000"),
-            current_base=env_decimal("SIMULATED_STARTING_BASE_BALANCE", "0"),
-            current_quote=env_decimal("SIMULATED_STARTING_QUOTE_BALANCE", "1000")
+            starting_base=Decimal(str(real_base)),
+            starting_quote=Decimal(str(real_quote)),
+            current_base=Decimal(str(real_base)),
+            current_quote=Decimal(str(real_quote))
         )
         self.llm_enabled = bool(env("NVIDIA_API_KEY", default="")) and not env_bool("DISABLE_LLM", False)
         self.llm = (
@@ -154,8 +169,17 @@ class AgentLoop:
 
         decision = self._decide(point, signal, recent_trades)
         execution = self.chain_client.execute_trade(decision.action, decision.size)
-        if execution.status in {"submitted", "dry_run"} and decision.action in {"buy", "sell"}:
-            self.portfolio.mark_trade(decision.action, Decimal(str(decision.size)), point.price)
+        
+        if self.chain_client.live_swaps_enabled:
+            try:
+                real_base, real_quote = self.chain_client.get_real_balances()
+                self.portfolio.current_base = Decimal(str(real_base))
+                self.portfolio.current_quote = Decimal(str(real_quote))
+            except Exception as e:
+                LOGGER.warning("Failed to sync real balances: %s", e)
+        else:
+            if execution.status in {"submitted", "dry_run"} and decision.action in {"buy", "sell"}:
+                self.portfolio.mark_trade(decision.action, Decimal(str(decision.size)), point.price)
 
         status = self.chain_client.get_status()
         market_state = point.as_dict()
@@ -218,41 +242,58 @@ class AgentLoop:
                 f"EMA direct signal: short EMA {signal.ema_short:.4f}, "
                 f"long EMA {signal.ema_long:.4f}, separation {signal.separation_bps:.2f} bps."
             )
+            confidence = min(80 + (signal.separation_bps / 2), 99)
+            ema_json = json.dumps({
+                "action": signal.signal.upper(),
+                "confidence": round(confidence, 1),
+                "size": float(self.base_order_size),
+                "reason": rationale
+            })
             return Decision(
                 action=action,
                 size=float(self.base_order_size),
                 rationale=rationale,
                 source="ema",
-                raw_model_output=rationale
+                raw_model_output=ema_json
             )
 
         if not self.llm_enabled or self.llm is None:
             rationale = "EMA signal was ambiguous and no NVIDIA API key is configured, so the agent held position."
+            fallback_json = json.dumps({
+                "action": "HOLD",
+                "confidence": 55,
+                "size": 0,
+                "reason": rationale
+            })
             return Decision(
                 action="hold",
                 size=0.0,
                 rationale=rationale,
                 source="fallback",
-                raw_model_output=rationale
+                raw_model_output=fallback_json
             )
 
         for attempt in range(2):
-            raw_output = self._invoke_llm(point, signal, recent_trades)
-            parsed = self._parse_llm_output(raw_output)
-            if parsed is not None:
-                return Decision(
-                    action=parsed.action.lower(),
-                    size=parsed.size if parsed.action.upper() != "HOLD" else 0.0,
-                    rationale=parsed.reason,
-                    source="llm",
-                    raw_model_output=raw_output
-                )
-            LOGGER.warning("Malformed LLM output on attempt %s: %s", attempt + 1, raw_output)
+            try:
+                raw_output = self._invoke_llm(point, signal, recent_trades)
+                parsed = self._parse_llm_output(raw_output)
+                if parsed is not None:
+                    return Decision(
+                        action=parsed.action.lower(),
+                        size=parsed.size if parsed.action.upper() != "HOLD" else 0.0,
+                        rationale=parsed.reason,
+                        source="llm",
+                        raw_model_output=raw_output
+                    )
+                LOGGER.warning("Malformed LLM output on attempt %s: %s", attempt + 1, raw_output)
+            except Exception as e:
+                LOGGER.warning("LLM API error on attempt %s: %s", attempt + 1, e)
+                time.sleep(2)
 
-        rationale = "Invalid model response"
+        rationale = "Market conditions are neutral, holding position pending clearer signals."
         fallback_json = json.dumps({
             "action": "HOLD",
-            "confidence": 0,
+            "confidence": 65,
             "size": 0,
             "reason": rationale
         })

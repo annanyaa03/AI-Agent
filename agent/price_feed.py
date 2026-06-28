@@ -7,9 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from web3 import HTTPProvider, Web3
-from web3.contract import Contract
-from web3.exceptions import ContractLogicError
+import requests
 
 try:
     from .config import env, env_bool, env_int
@@ -118,14 +116,14 @@ class PythPriceFeedClient:
         allow_stale: bool = False,
         request_timeout_seconds: int = 15
     ) -> None:
-        provider = HTTPProvider(rpc_url, request_kwargs={"timeout": request_timeout_seconds})
-        self.web3 = Web3(provider)
-        self.contract_address = Web3.to_checksum_address(contract_address)
-        self.contract: Contract = self.web3.eth.contract(address=self.contract_address, abi=PYTH_ABI)
+        self.contract_address = contract_address
         self.eth_usd_feed_id = self._normalize_feed_id(eth_usd_feed_id)
         self.usdc_usd_feed_id = self._normalize_feed_id(usdc_usd_feed_id)
         self.max_staleness_seconds = max_staleness_seconds
         self.allow_stale = allow_stale
+        self.request_timeout_seconds = request_timeout_seconds
+        # Remove web3 connection, use Hermes REST API
+        self.hermes_url = "https://hermes.pyth.network/v2/updates/price/latest"
 
     @staticmethod
     def _normalize_feed_id(feed_id: str) -> str:
@@ -142,51 +140,48 @@ class PythPriceFeedClient:
     def _scale(raw_price: int, exponent: int) -> Decimal:
         return Decimal(raw_price) * (Decimal(10) ** Decimal(exponent))
 
-    def _decode(self, payload: Any, feed_id: str) -> RawPythPrice:
-        price = int(payload[0])
-        confidence = int(payload[1])
-        exponent = int(payload[2])
-        publish_time = int(payload[3])
-
-        scaled_price = self._scale(price, exponent)
-        scaled_confidence = self._scale(confidence, exponent)
-
-        return RawPythPrice(
-            price=scaled_price,
-            confidence=scaled_confidence,
-            exponent=exponent,
-            publish_time=publish_time,
-            feed_id=feed_id
-        )
-
-    def _read_single_feed(self, feed_id: str) -> RawPythPrice:
+    def _fetch_from_hermes(self) -> dict[str, RawPythPrice]:
         try:
-            payload = self.contract.functions.getPriceNoOlderThan(
-                feed_id, self.max_staleness_seconds
-            ).call()
-        except ContractLogicError:
-            payload = self.contract.functions.getPriceUnsafe(feed_id).call()
-        except Exception as exc:  # noqa: BLE001
-            raise PriceFeedError(f"Failed reading Pyth feed {feed_id}: {exc}") from exc
+            params = {
+                "ids[]": [self.eth_usd_feed_id, self.usdc_usd_feed_id]
+            }
+            res = requests.get(self.hermes_url, params=params, timeout=self.request_timeout_seconds)
+            res.raise_for_status()
+            data = res.json()
+            
+            prices = {}
+            for item in data.get("parsed", []):
+                feed_id = "0x" + item["id"]
+                price_data = item["price"]
+                
+                price = int(price_data["price"])
+                conf = int(price_data["conf"])
+                expo = int(price_data["expo"])
+                publish_time = int(price_data["publish_time"])
 
-        price = self._decode(payload, feed_id)
-        age = int(time.time()) - price.publish_time
-        is_stale = age > self.max_staleness_seconds
-        if is_stale:
-            msg = f"Feed {feed_id} is stale by {age}s (max allowed {self.max_staleness_seconds}s). Publish time: {price.publish_time}."
-            if self.allow_stale:
-                LOGGER.warning(msg)
-            else:
-                raise StalePriceError(msg)
+                scaled_price = self._scale(price, expo)
+                scaled_conf = self._scale(conf, expo)
 
-        return price
+                prices[feed_id] = RawPythPrice(
+                    price=scaled_price,
+                    confidence=scaled_conf,
+                    exponent=expo,
+                    publish_time=publish_time,
+                    feed_id=feed_id
+                )
+            
+            if self.eth_usd_feed_id not in prices or self.usdc_usd_feed_id not in prices:
+                raise PriceFeedError("Hermes API did not return both required feeds.")
+                
+            return prices
+            
+        except Exception as exc:
+            raise PriceFeedError(f"Failed to fetch Pyth prices from Hermes: {exc}") from exc
 
     def get_latest_price(self) -> PricePoint:
-        if not self.web3.is_connected():
-            raise PriceFeedError("RPC connection failed. Check MONAD_TESTNET_RPC_URL and network access.")
-
-        eth_usd = self._read_single_feed(self.eth_usd_feed_id)
-        usdc_usd = self._read_single_feed(self.usdc_usd_feed_id)
+        prices = self._fetch_from_hermes()
+        eth_usd = prices[self.eth_usd_feed_id]
+        usdc_usd = prices[self.usdc_usd_feed_id]
 
         try:
             cross_price = eth_usd.price / usdc_usd.price
